@@ -1,9 +1,21 @@
 '''
 serializers for APP
 '''
-
+import os
+import copy
+from six import text_type
+from saml2 import BINDING_HTTP_POST, BINDING_HTTP_REDIRECT
+from saml2.config import SPConfig
+from saml2.metadata import entity_descriptor
+from saml2.entity_category.edugain import COC
+from saml2.saml import NAME_FORMAT_URI
+try:
+    from saml2.sigver import get_xmlsec_binary
+except ImportError:
+    get_xmlsec_binary = None
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError, MethodNotAllowed
+
 from common.django.drf.serializer import DynamicFieldsModelSerializer
 
 from oneid_meta.models import (
@@ -18,6 +30,13 @@ from oneid_meta.models import (
 )
 from siteapi.v1.views.utils import gen_uid
 from siteapi.v1.serializers.perm import PermWithOwnerSerializer
+
+if get_xmlsec_binary:
+    xmlsec_path = get_xmlsec_binary(["/opt/local/bin", "/usr/local/bin"])    # pylint: disable=invalid-name
+else:
+    xmlsec_path = '/usr/local/bin/xmlsec1'    # pylint: disable=invalid-name
+
+BASEDIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 class OAuthAPPSerializer(DynamicFieldsModelSerializer):
@@ -44,8 +63,7 @@ class OAuthAPPSerializer(DynamicFieldsModelSerializer):
 
 
 class OIDCAPPSerializer(DynamicFieldsModelSerializer):
-    '''
-    Serializer for OIDCAPP
+    '''Serializer for OIDCAPP
     '''
     class Meta:    # pylint: disable=missing-docstring
         model = OIDCAPP
@@ -54,13 +72,111 @@ class OIDCAPPSerializer(DynamicFieldsModelSerializer):
 
 
 class SAMLAPPSerializer(DynamicFieldsModelSerializer):
+    '''Serializer for SAMLAPP
     '''
-    Serializer for SAMLAPP
-    '''
+    uid = serializers.CharField(required=False)
+    metafile = serializers.FileField(max_length=255, required=False)
+    cert = serializers.CharField(max_length=2148, required=False)
+
     class Meta:    # pylint: disable=missing-docstring
         model = SAMLAPP
 
-        fields = ()
+        fields = (
+            'uid',
+            'entity_id',
+            'acs',
+            'sls',
+            'cert',
+            'metafile',
+            'more_detail',
+        )
+
+    def dump_cert(self, uid, cert):    # pylint: disable=no-self-use
+        '''存储SP方公钥
+        '''
+        with open(BASEDIR + '/djangosaml2idp/saml2_config/sp_cert/%s.pem' % uid, 'w+') as f:
+            f.write(cert)
+
+    def write_xml(self, uid, entity_id, acs, sls):    # pylint: disable=no-self-use
+        '''将SAMLAPP配置写入指定路径xml文件
+        '''
+        conf = SPConfig()
+        endpointconfig = {
+            "entityid": entity_id,
+            'entity_category': [COC],
+            "description": "extra SP setup",
+            "service": {
+                "sp": {
+                    "want_response_signed": False,
+                    "authn_requests_signed": True,
+                    "logout_requests_signed": True,
+                    "endpoints": {
+                        "assertion_consumer_service": [(acs, BINDING_HTTP_POST)],
+                        "single_logout_service": [
+                            (sls, BINDING_HTTP_REDIRECT),
+                            (sls.replace('redirect', 'post'), BINDING_HTTP_POST),
+                        ],
+                    }
+                },
+            },
+            "key_file": BASEDIR + "/djangosaml2idp/certificates/mykey.pem",    # 随便放一个私钥，并不知道SP私钥
+            "cert_file": BASEDIR + '/djangosaml2idp/saml2_config/sp_cert/%s.pem' % uid,
+            "xmlsec_binary": xmlsec_path,
+            "metadata": {
+                "local": [BASEDIR + '/djangosaml2idp/saml2_config/idp_metadata.xml']
+            },
+            "name_form": NAME_FORMAT_URI,
+        }
+        conf.load(copy.deepcopy(endpointconfig))
+        meta_data = entity_descriptor(conf)
+        content = text_type(meta_data).encode('utf-8')
+        with open(BASEDIR + '/djangosaml2idp/saml2_config/sp_metadata_%s.xml' % uid, 'wb+') as f:
+            f.write(content)
+
+    def create(self, validated_data):
+        uid = validated_data.get('uid', '')
+        metafile = validated_data.get('metafile', None)
+        kwargs = {'uid': uid}
+        if metafile:
+            metapath = BASEDIR + '/djangosaml2idp/saml2_config/sp_metadata_%s.xml' % uid
+            with open(metapath, 'wb+') as dest:
+                for chunk in metafile.chunks():
+                    dest.write(chunk)
+            kwargs['metapath'] = metapath
+        else:
+            entity_id = validated_data.get('entity_id', '')
+            acs = validated_data.get('acs', '')
+            sls = validated_data.get('sls', '')
+            cert = validated_data.get('cert', '')
+            self.dump_cert(uid, cert)
+            self.write_xml(uid=uid, entity_id=entity_id, acs=acs, sls=sls)
+            metapath = BASEDIR + '/djangosaml2idp/saml2_config/sp_metadata_%s.xml' % uid
+            kwargs.update({'acs': acs, 'sls': sls, 'entity_id': entity_id, 'metapath': metapath})
+        app = APP.valid_objects.filter(uid=uid).first()
+        saml_app, _ = SAMLAPP.valid_objects.get_or_create(app=app)
+        saml_app.__dict__.update(**kwargs)
+        saml_app.save()
+        return saml_app
+
+    def update(self, instance, validated_data):
+        saml_app = instance
+        uid = saml_app.app.uid
+        metafile = validated_data.get('metafile', None)
+        metapath = BASEDIR + '/djangosaml2idp/saml2_config/sp_metadata_%s.xml' % uid
+        if metafile:
+            with open(metapath, 'wb+') as dest:
+                for chunk in metafile.chunks():
+                    dest.write(chunk)
+        else:
+            entity_id = validated_data.get('entity_id', '')
+            acs = validated_data.get('acs', '')
+            sls = validated_data.get('sls', '')
+            cert = validated_data.get('cert', '')
+            self.dump_cert(uid, cert)
+            self.write_xml(uid=uid, entity_id=entity_id, acs=acs, sls=sls)
+        saml_app.__dict__.update(entity_id=entity_id, acs=acs, sls=sls, metapath=metapath)
+        saml_app.save()
+        return saml_app
 
 
 class LDAPAPPSerializer(DynamicFieldsModelSerializer):
@@ -116,7 +232,7 @@ class APPSerializer(DynamicFieldsModelSerializer):
     http_app = HTTPAPPSerializer(many=False, required=False, allow_null=True)
     ldap_app = LDAPAPPSerializer(many=False, required=False, allow_null=True)
     oidc_app = OIDCAPPSerializer(many=False, required=False)
-    saml_app = SAMLAPPSerializer(many=False, required=False)
+    saml_app = SAMLAPPSerializer(many=False, required=False, allow_null=True)
 
     uid = serializers.CharField(required=False, help_text='默认情况下根据`name`生成')
 
@@ -184,13 +300,16 @@ class APPSerializer(DynamicFieldsModelSerializer):
         if oidc_app_data:
             pass
 
-        if saml_app_data:
-            pass
+        if saml_app_data is not None:
+            saml_app_data['uid'] = validated_data['uid']
+            serializer = SAMLAPPSerializer(data=saml_app_data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save(app=app)
 
         return app
 
     # TODO: support update name of app
-    def update(self, instance, validated_data):
+    def update(self, instance, validated_data):    # pylint: disable=too-many-branches, too-many-statements
         '''
         update app
         update/create oauth_app if provided
@@ -202,7 +321,6 @@ class APPSerializer(DynamicFieldsModelSerializer):
             raise MethodNotAllowed('MODIFY protected APP')
 
         oidc_app_data = validated_data.pop('oidc_app', None)
-        saml_app_data = validated_data.pop('saml_app', None)
 
         uid = validated_data.pop('uid', '')
         if uid and uid != app.uid:
@@ -259,8 +377,21 @@ class APPSerializer(DynamicFieldsModelSerializer):
         if oidc_app_data:
             pass
 
-        if saml_app_data:
-            pass
+        if 'saml_app' in validated_data:
+            saml_app_data = validated_data.pop('saml_app')
+            if data is None:
+                if hasattr(app, 'saml_app'):
+                    instance = app.saml_app
+                    instance.delete()
+            else:
+                if hasattr(app, 'saml_app'):
+                    serializer = SAMLAPPSerializer(app.saml_app, data=saml_app_data, partial=True)
+                    serializer.is_valid(raise_exception=True)
+                    serializer.save()
+                else:
+                    serializer = SAMLAPPSerializer(data=data)
+                    serializer.is_valid(raise_exception=True)
+                    serializer.save(app=app)
 
         app.__dict__.update(validated_data)
         app.save()
